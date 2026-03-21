@@ -152,13 +152,23 @@ class ReplayBuffer:
     def sample_states_for_dreaming(self, batch_size, device=None):
         real_mask = ~self.is_dream[:self.size]
         real_idx = torch.where(real_mask)[0]
-        
+
         if len(real_idx) == 0:
             ind = torch.randint(0, self.size, (batch_size,), device=self.device)
-        else:
-            idx_in_real = torch.randint(0, len(real_idx), (min(batch_size, len(real_idx)),), device=self.device)
-            ind = real_idx[idx_in_real]
-            
+            return self.normalize_obs(self.state[ind])
+
+        # 60% from most recent 20% of real transitions (on-policy starts),
+        # 40% uniform over all real transitions (coverage).
+        recent_k = max(1, len(real_idx) // 5)
+        recent_idx = real_idx[-recent_k:]
+
+        n_recent = int(batch_size * 0.6)
+        n_uniform = batch_size - n_recent
+
+        recent_sample = recent_idx[torch.randint(0, len(recent_idx), (n_recent,), device=self.device)]
+        uniform_sample = real_idx[torch.randint(0, len(real_idx), (n_uniform,), device=self.device)]
+        ind = torch.cat([recent_sample, uniform_sample])
+
         return self.normalize_obs(self.state[ind])
         
     def denormalize_obs(self, obs):

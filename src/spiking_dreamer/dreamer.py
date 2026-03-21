@@ -81,29 +81,33 @@ class EnhancedDreamer:
         
         for t in range(horizon):
             with torch.no_grad():
-                # Actor action
-                action = self.actor(curr_obs)
-                
+                # Actor action - denormalize obs first (actor trained on raw env obs)
+                if hasattr(self.replay_buffer, 'denormalize_obs'):
+                    actor_obs = self.replay_buffer.denormalize_obs(curr_obs)
+                else:
+                    actor_obs = curr_obs
+                action = self.actor(actor_obs)
+
                 # Noise
                 noise = torch.randn_like(action) * exploration_noise
                 action = (action + noise).clamp(-1.0, 1.0)
-                
-                # World model prediction
+
+                # World model prediction (world model expects normalized obs)
                 step_results = self.world_model.step(curr_obs, action)
                 if len(step_results) == 6:
                     next_obs, reward, _, _, mean_epistemic, _ = step_results
                 else:
                     next_obs, reward, _, _, mean_epistemic = step_results
-                
+
                 # Track uncertainty stats
                 uncertainty = mean_epistemic.squeeze()
                 if uncertainty.dim() == 0:
                     uncertainty = uncertainty.unsqueeze(0)
                 total_uncertainty += uncertainty.mean().item()
                 uncertainty_count += 1
-                
-                # Horizon-adaptive threshold
-                step_threshold = self.epistemic_threshold * (0.85 ** t)
+
+                # Fixed threshold - no aggressive horizon decay
+                step_threshold = self.epistemic_threshold
                 mask = uncertainty < step_threshold
                 
                 valid_idx = torch.where(mask)[0]

@@ -1,6 +1,6 @@
 # Core dependencies
 torch>=2.0.0
-gymnasium[mujoco]>=0.29.0
+gymnasium[mujoco,other]>=0.29.0
 numpy>=1.24.0
 tensorboard>=2.12.0
 wandb>=0.15.0

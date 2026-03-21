@@ -6,10 +6,12 @@ Usage:
     python train.py --config configs/halfcheetah.yaml
     python train.py --env HalfCheetah-v4 --seed 42
     python train.py --no-dreaming  # Baseline mode
+    python train.py --resume       # Auto-resume from latest checkpoint
 """
 
 import os
 import sys
+import glob
 import random
 import argparse
 from pathlib import Path
@@ -24,6 +26,22 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from spiking_dreamer import TD3_SpikingDreamer, ReplayBuffer, eval_policy, make_env
+
+
+def find_latest_checkpoint(suffix, env_name, seed):
+    """Return the path of the most recent periodic checkpoint, or None."""
+    pattern = f"checkpoints/{suffix}_{env_name}_{seed}_step*.pt"
+    files = sorted(glob.glob(pattern))
+    return files[-1] if files else None
+
+
+def cleanup_old_checkpoints(suffix, env_name, seed, keep=3):
+    """Delete old periodic checkpoints, keeping only the most recent `keep`."""
+    pattern = f"checkpoints/{suffix}_{env_name}_{seed}_step*.pt"
+    files = sorted(glob.glob(pattern))
+    for f in files[:-keep]:
+        os.remove(f)
+        print(f"  Removed old checkpoint: {f}")
 
 
 def load_config(config_path: str, default_path: str = "configs/default.yaml") -> dict:
@@ -55,6 +73,8 @@ def main():
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="spiking-dreamer",
                         help="W&B project name")
+    parser.add_argument("--resume", action="store_true",
+                        help="Auto-resume from latest periodic checkpoint")
     args = parser.parse_args()
     
     # Load config
@@ -105,66 +125,84 @@ def main():
     # Initialize
     replay_buffer = ReplayBuffer(state_dim, action_dim, config["replay_size"], device=device)
     policy = TD3_SpikingDreamer(state_dim, action_dim, max_action, device, config, replay_buffer)
-    
+
     # Logging
     suffix = "spiking_dream" if config["enable_dreaming"] else "baseline"
     log_dir = f"runs/popsan_{suffix}_{env_name}_{seed}"
     writer = SummaryWriter(log_dir)
     os.makedirs("checkpoints", exist_ok=True)
-    
+
+    # --- Resume from checkpoint if requested ---
+    start_t = 0
+    best_reward = float('-inf')
+    evaluations = []
+
+    if args.resume:
+        ckpt_path = find_latest_checkpoint(suffix, env_name, seed)
+        if ckpt_path:
+            start_t, best_reward, evaluations = policy.load_checkpoint(ckpt_path)
+            print(f"Resumed from {ckpt_path} at step {start_t}")
+            print(f"  Best reward so far: {best_reward:.1f}")
+        else:
+            print("No checkpoint found — starting fresh.")
+
+    if not evaluations:
+        evaluations = [eval_policy(policy, env_name, seed)]
+        print(f"Initial eval: {evaluations[-1][0]:.1f}")
+    print("-" * 70)
+
     if args.wandb:
         wandb.init(
             project=args.wandb_project,
             name=f"{suffix}_{env_name}_{seed}",
             config=config,
+            resume="allow",
         )
-    
-    # Initial evaluation
-    evaluations = [eval_policy(policy, env_name, seed)]
-    print(f"Initial eval: {evaluations[-1][0]:.1f}")
-    print("-" * 70)
-    
+
     state, _ = env.reset()
     episode_reward = 0
     episode_timesteps = 0
     episode_num = 0
-    best_reward = float('-inf')
-    
+
     # Accumulators
     critic_loss_acc = 0.0
     actor_loss_acc = 0.0
     train_count = 0
     last_dream_metrics = {}
-    
-    for t in range(int(config["total_steps"] + config["start_timesteps"])):
+
+    checkpoint_freq = config.get("checkpoint_freq", 100000)
+    total_t = int(config["total_steps"] + config["start_timesteps"])
+
+    for t in range(start_t, total_t):
         episode_timesteps += 1
-        
-        if t < config["start_timesteps"]:
+
+        # Warmup: random actions until buffer has enough data (handles fresh + resumed starts)
+        if replay_buffer.size < config["start_timesteps"]:
             action = env.action_space.sample()
         else:
             action = (
                 policy.select_action(state)
                 + np.random.normal(0, max_action * config["expl_noise"], size=action_dim)
             ).clip(-max_action, max_action)
-        
+
         next_state, reward, d1, d2, _ = env.step(action)
         done = d1 or d2
         done_bool = float(done) if episode_timesteps < env._max_episode_steps else 0
-        
+
         replay_buffer.add(state, action, next_state, reward, done_bool, is_dream=False)
         state = next_state
         episode_reward += reward
-        
-        # Training
-        if t >= config["start_timesteps"]:
+
+        # Training — only once buffer is large enough
+        if replay_buffer.size >= config["batch_size"] and replay_buffer.size >= config["start_timesteps"]:
             if config["enable_dreaming"]:
                 policy.train_world_model(replay_buffer, config["batch_size"])
-            
+
             c_loss, a_loss = policy.train(replay_buffer, config["batch_size"])
             critic_loss_acc += c_loss
             actor_loss_acc += a_loss
             train_count += 1
-            
+
             # Dreaming phase
             if config["enable_dreaming"] and t >= config["dream_start_step"] and t % config["dream_freq"] == 0:
                 dreams_added, phase_metrics_list = policy.dream_phase(replay_buffer)
@@ -231,13 +269,24 @@ def main():
             if eval_reward > best_reward:
                 best_reward = eval_reward
                 policy.save(f"checkpoints/{suffix}_{env_name}_{seed}_best.pt")
-            
+                print(f"  *** New best! Saved best checkpoint ***")
+
             critic_loss_acc = 0.0
             actor_loss_acc = 0.0
             train_count = 0
-    
+
+        # Periodic checkpoint — save every checkpoint_freq steps so we can always resume
+        if (t + 1) % checkpoint_freq == 0:
+            ckpt_path = f"checkpoints/{suffix}_{env_name}_{seed}_step{t+1:08d}.pt"
+            policy.save_checkpoint(ckpt_path, t + 1, best_reward, evaluations)
+            print(f"[Checkpoint] Saved {ckpt_path}")
+            cleanup_old_checkpoints(suffix, env_name, seed, keep=3)
+
     # Final save
-    policy.save(f"checkpoints/{suffix}_{env_name}_{seed}_final.pt")
+    policy.save_checkpoint(
+        f"checkpoints/{suffix}_{env_name}_{seed}_final.pt",
+        total_t, best_reward, evaluations
+    )
     
     print("\n" + "=" * 70)
     print(f"Training Complete! Best reward: {best_reward:.1f}")

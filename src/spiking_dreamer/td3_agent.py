@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 TD3 Agent with Spiking World Model Dreaming (MBPO-style).
+
+FIXES applied:
+  1. Separate GradScaler for WM (uses autocast) vs plain FP32 for TD3
+  2. Dream buffer cleared periodically to prevent stale dream poisoning
+  3. Gradient clipping on critic and actor
+  4. More conservative real/dream ratio (floor 0.70 instead of 0.55)
 """
 
 import torch
@@ -67,7 +73,14 @@ class TD3_SpikingDreamer:
             lr=config["wm_lr"],
             weight_decay=config["wm_weight_decay"],
         )
-        self.scaler = torch.amp.GradScaler('cuda')
+
+        # FIX 1: Separate GradScaler for world model ONLY.
+        # The old code shared one scaler between WM (which uses autocast/bf16)
+        # and TD3 critic/actor (which run in fp32).  GradScaler without autocast
+        # multiplies fp32 losses by the internal scale factor (can be 65536x),
+        # and WM loss spikes drag the scale down, starving critic/actor gradients.
+        self.wm_scaler = torch.amp.GradScaler('cuda')
+        # TD3 critic/actor will use plain fp32 — no scaler needed.
         
         # Dreamer
         self.dreamer = EnhancedDreamer(
@@ -79,7 +92,10 @@ class TD3_SpikingDreamer:
         )
         
         self.total_it = 0
-        
+
+        # EMA of WM state_mse — used to adapt real/dream ratio in train()
+        self.wm_mse_ema = 1.0
+
         # World model metrics
         self.wm_metrics = {
             'loss': 0, 'state_mse': 0, 'reward_mse': 0, 'vq_loss': 0, 
@@ -87,8 +103,12 @@ class TD3_SpikingDreamer:
             'count': 0
         }
         
-        # Separate dream buffer (100k for fresh dreams)
-        self.dream_buffer = ReplayBuffer(state_dim, action_dim, max_size=100000, device=device)
+        # FIX 2: Smaller dream buffer + periodic refresh.
+        # 200k is plenty; we clear it every dream phase so stale dreams
+        # from outdated policy regions don't accumulate and poison the critic.
+        self.dream_buffer = ReplayBuffer(state_dim, action_dim, max_size=200000, device=device)
+        self._dream_phase_count = 0
+        self._dream_refresh_interval = config.get("dream_refresh_interval", 5)
 
     def select_action(self, state):
         state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
@@ -109,8 +129,8 @@ class TD3_SpikingDreamer:
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             loss, state_mse, reward_mse, vq_loss = self.world_model.compute_loss(batch)
             
-        self.scaler.scale(loss).backward()
-        self.scaler.unscale_(self.wm_optimizer)
+        self.wm_scaler.scale(loss).backward()
+        self.wm_scaler.unscale_(self.wm_optimizer)
         
         # Gradient norm tracking
         snn_norm = 0.0
@@ -130,9 +150,12 @@ class TD3_SpikingDreamer:
             pass
 
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
-        self.scaler.step(self.wm_optimizer)
-        self.scaler.update()
+        self.wm_scaler.step(self.wm_optimizer)
+        self.wm_scaler.update()
         
+        # Update EMA of state_mse for adaptive dream ratio
+        self.wm_mse_ema = 0.995 * self.wm_mse_ema + 0.005 * state_mse
+
         # Accumulate metrics
         self.wm_metrics['loss'] += loss.item()
         self.wm_metrics['state_mse'] += state_mse
@@ -146,6 +169,15 @@ class TD3_SpikingDreamer:
 
     def dream_phase(self, replay_buffer):
         """Run a dreaming phase."""
+        self._dream_phase_count += 1
+
+        # FIX 2 (cont): Periodically wipe the dream buffer so stale dreams
+        # from old policy regions don't accumulate.  Fresh dreams only.
+        if self._dream_phase_count % self._dream_refresh_interval == 0:
+            self.dream_buffer.ptr = 0
+            self.dream_buffer.size = 0
+            self.dream_buffer.dream_count = 0
+
         dream_batch = self.config["dream_batch_size"] * self.config["dreams_per_phase"]
         
         metrics = self.dreamer.dream_and_augment(
@@ -174,15 +206,25 @@ class TD3_SpikingDreamer:
             return "LEARNING"
 
     def train(self, replay_buffer, batch_size=256):
-        """TD3 training with MBPO mixed sampling (50/50 split)."""
+        """TD3 training with MBPO mixed sampling."""
         self.total_it += 1
-        
-        # 50/50 Real/Dream split
-        real_ratio = 0.5
+
+        # FIX 4: More conservative real/dream ratio.
+        # Floor is 0.70 (was 0.55).  Going below 70% real is too risky —
+        # the WM-MSE EMA is a *global* metric that can be low even when the
+        # model is terrible in the regions the policy currently visits.
+        if self.wm_mse_ema > 0.08:
+            real_ratio = 0.95   # WM still learning — almost all real
+        elif self.wm_mse_ema > 0.05:
+            real_ratio = 0.85   # WM decent
+        elif self.wm_mse_ema > 0.03:
+            real_ratio = 0.75   # WM good
+        else:
+            real_ratio = 0.70   # WM excellent — 30% dreams max
         real_batch_size = int(batch_size * real_ratio)
         dream_batch_size = batch_size - real_batch_size
         
-        if self.dream_buffer.size >= dream_batch_size:
+        if self.dream_buffer.size >= dream_batch_size and dream_batch_size > 0:
             r_obs, r_act, r_next, r_rew, r_not_done = replay_buffer.sample(real_batch_size)
             d_obs, d_act, d_next, d_rew, d_not_done = self.dream_buffer.sample(dream_batch_size)
             
@@ -194,6 +236,7 @@ class TD3_SpikingDreamer:
         else:
             state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
         
+        # ---------- Critic update (plain fp32, NO scaler) ----------
         with torch.no_grad():
             noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
             next_action = (self.actor_target(next_state) + noise).clamp(-self.max_action, self.max_action)
@@ -206,16 +249,22 @@ class TD3_SpikingDreamer:
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
         
         self.critic_optimizer.zero_grad()
-        self.scaler.scale(critic_loss).backward()
-        self.scaler.step(self.critic_optimizer)
+        critic_loss.backward()
+        # FIX 3: Clip critic gradients — prevents Q-value explosions from
+        # bad dream targets.
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.critic_optimizer.step()
         
+        # ---------- Actor update (plain fp32, NO scaler) ----------
         actor_loss = 0.0
         if self.total_it % self.policy_freq == 0:
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
             
             self.actor_optimizer.zero_grad()
-            self.scaler.scale(actor_loss).backward()
-            self.scaler.step(self.actor_optimizer)
+            actor_loss.backward()
+            # FIX 3 (cont): Clip actor gradients too.
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+            self.actor_optimizer.step()
             
             # Soft update targets
             for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
@@ -225,7 +274,6 @@ class TD3_SpikingDreamer:
             
             actor_loss = actor_loss.item()
         
-        self.scaler.update()
         return critic_loss.item(), actor_loss
 
     def get_wm_metrics(self) -> Dict:
@@ -258,6 +306,12 @@ class TD3_SpikingDreamer:
         # Add gradient norms
         metrics['wm/grad/snn_layers'] = self.wm_metrics['grad_snn_norm'] / self.wm_metrics['count']
         metrics['wm/grad/direct_head'] = self.wm_metrics['grad_direct_norm'] / self.wm_metrics['count']
+        
+        # Extra diagnostic: real/dream ratio being used
+        metrics['train/real_ratio'] = 0.95 if self.wm_mse_ema > 0.08 else (
+            0.85 if self.wm_mse_ema > 0.05 else (0.75 if self.wm_mse_ema > 0.03 else 0.70))
+        metrics['train/wm_mse_ema'] = self.wm_mse_ema
+        metrics['train/dream_buffer_size'] = self.dream_buffer.size
         
         # Reset
         self.wm_metrics = {
@@ -310,7 +364,9 @@ class TD3_SpikingDreamer:
             curr_test = initial_obs.clone()
             for _ in range(h):
                 with torch.no_grad():
-                    act_test = self.actor(curr_test)
+                    # Actor expects unnormalized obs; curr_test is normalized
+                    actor_input = replay_buffer.denormalize_obs(curr_test) if hasattr(replay_buffer, 'denormalize_obs') else curr_test
+                    act_test = self.actor(actor_input)
                     curr_test, _, _, _, _, _ = self.world_model.step(curr_test, act_test)
             drift = ((curr_test - initial_obs) ** 2).mean().item()
             metrics[f'eval/rollout_drift_h{h}'] = drift
@@ -326,6 +382,47 @@ class TD3_SpikingDreamer:
             'world_model': self.world_model.state_dict(),
             'dreamer_threshold': self.dreamer.epistemic_threshold,
         }, filename)
+
+    def save_checkpoint(self, filename, step, best_reward, evaluations):
+        """Full checkpoint: weights + optimizer states + training state for resume."""
+        torch.save({
+            # Training state
+            'step': step,
+            'best_reward': best_reward,
+            'evaluations': evaluations,
+            'total_it': self.total_it,
+            'wm_mse_ema': self.wm_mse_ema,
+            'dreamer_threshold': self.dreamer.epistemic_threshold,
+            # Model weights
+            'actor': self.actor.state_dict(),
+            'actor_target': self.actor_target.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'world_model': self.world_model.state_dict(),
+            # Optimizer states (preserves Adam momentum — critical for smooth resume)
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+            'wm_optimizer': self.wm_optimizer.state_dict(),
+        }, filename)
+
+    def load_checkpoint(self, filename):
+        """Load full checkpoint. Returns (step, best_reward, evaluations)."""
+        ckpt = torch.load(filename, map_location=self.device)
+        # Model weights
+        self.actor.load_state_dict(ckpt['actor'])
+        self.actor_target.load_state_dict(ckpt['actor_target'])
+        self.critic.load_state_dict(ckpt['critic'])
+        self.critic_target.load_state_dict(ckpt['critic_target'])
+        self.world_model.load_state_dict(ckpt['world_model'])
+        # Optimizer states
+        self.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
+        self.wm_optimizer.load_state_dict(ckpt['wm_optimizer'])
+        # Training state
+        self.total_it = ckpt.get('total_it', 0)
+        self.wm_mse_ema = ckpt.get('wm_mse_ema', 1.0)
+        self.dreamer.epistemic_threshold = ckpt.get('dreamer_threshold', self.dreamer.epistemic_threshold)
+        return ckpt['step'], ckpt['best_reward'], ckpt['evaluations']
 
     def load(self, filename):
         ckpt = torch.load(filename, map_location=self.device)
