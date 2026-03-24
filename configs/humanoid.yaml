@@ -7,17 +7,23 @@ checkpoint_freq: 50000    # Save resumable checkpoint every 50k steps (keeps las
 
 # Humanoid is higher dimensional and generally needs more warmup.
 start_timesteps: 50000
-dream_start_step: 125000
+dream_start_step: 300000  # Wait until agent can walk — richer WM training data
+dream_ramp_steps: 100000  # Ramp dream ratio from 20% → full over 100k steps after dream start
 dream_horizon: 1
 
 # Permissive threshold: Humanoid has high-dim obs so ensemble variance is naturally larger.
 # Threshold=0.3 was filtering >90% of dreams → stagnation.
-epistemic_threshold: 1.5
+epistemic_threshold: 0.7
 
 # Low penalty: Humanoid rewards ~5-20/step; penalty=1.0 was wiping out dream signal.
 uncertainty_penalty: 0.2
 
+# Dream exploration noise: higher than env noise to cover more state space.
+dream_exploration_noise: 0.3
+
 # Dream more frequently and more per phase for better sample efficiency.
+# dream_batch_size * dreams_per_phase = 1024 * 8 = 8192 parallel trajectories per phase.
+dream_batch_size: 1024
 dream_freq: 200
 dreams_per_phase: 8
 
@@ -25,3 +31,9 @@ dreams_per_phase: 8
 adaptive_threshold: false
 
 num_ensemble: 5
+
+# More WM capacity for 376-dim Humanoid (vs 256 for HalfCheetah's 17-dim).
+wm_hidden_dim: 512
+
+# Train WM 4 gradient steps per env step — Humanoid dynamics are harder to learn.
+wm_updates_per_step: 4

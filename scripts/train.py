@@ -196,7 +196,8 @@ def main():
         # Training — only once buffer is large enough
         if replay_buffer.size >= config["batch_size"] and replay_buffer.size >= config["start_timesteps"]:
             if config["enable_dreaming"]:
-                policy.train_world_model(replay_buffer, config["batch_size"])
+                for _ in range(config.get("wm_updates_per_step", 1)):
+                    policy.train_world_model(replay_buffer, config["batch_size"])
 
             c_loss, a_loss = policy.train(replay_buffer, config["batch_size"])
             critic_loss_acc += c_loss

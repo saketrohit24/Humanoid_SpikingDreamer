@@ -47,7 +47,7 @@ class EnhancedDreamer:
             'total_accepted': 0,
         }
         
-    def dream_and_augment(self, batch_size, horizon, target_buffer=None, exploration_noise=0.1):
+    def dream_and_augment(self, batch_size, horizon, target_buffer=None, exploration_noise=0.3):
         if target_buffer is None:
             target_buffer = self.replay_buffer
         

@@ -183,7 +183,8 @@ class TD3_SpikingDreamer:
         metrics = self.dreamer.dream_and_augment(
             batch_size=dream_batch,
             horizon=self.config["dream_horizon"],
-            target_buffer=self.dream_buffer
+            target_buffer=self.dream_buffer,
+            exploration_noise=self.config.get("dream_exploration_noise", 0.3),
         )
         
         return metrics['dreams_added'], [metrics]
@@ -209,18 +210,33 @@ class TD3_SpikingDreamer:
         """TD3 training with MBPO mixed sampling."""
         self.total_it += 1
 
-        # FIX 4: More conservative real/dream ratio.
-        # Floor is 0.70 (was 0.55).  Going below 70% real is too risky —
-        # the WM-MSE EMA is a *global* metric that can be low even when the
-        # model is terrible in the regions the policy currently visits.
+        # Adaptive real/dream ratio: WM quality gate + step-based decay.
+        # WM quality determines base dream fraction.
         if self.wm_mse_ema > 0.08:
-            real_ratio = 0.95   # WM still learning — almost all real
+            dream_frac = 0.05   # WM still learning — almost all real
         elif self.wm_mse_ema > 0.05:
-            real_ratio = 0.85   # WM decent
+            dream_frac = 0.15   # WM decent
         elif self.wm_mse_ema > 0.03:
-            real_ratio = 0.75   # WM good
+            dream_frac = 0.25   # WM good
         else:
-            real_ratio = 0.70   # WM excellent — 30% dreams max
+            dream_frac = 0.30   # WM excellent
+
+        # Step-based cap: dream ratio decays from 50% → 10% over training.
+        step_frac = min(1.0, self.total_it / max(1, self.config.get("total_steps", 2_000_000)))
+        step_max_dream = max(0.10, 0.50 * (1.0 - step_frac))
+        dream_frac = min(dream_frac, step_max_dream)
+
+        # Dream ramp-up: start at 20% dreams and ramp to full ratio over
+        # dream_ramp_steps after dreaming begins. Avoids shocking the critic
+        # with 30% dream data the moment dreams turn on.
+        dream_start = self.config.get("dream_start_step", 300000)
+        ramp_steps = self.config.get("dream_ramp_steps", 100000)
+        approx_env_step = self.total_it + self.config.get("start_timesteps", 50000)
+        steps_since_dream = max(0, approx_env_step - dream_start)
+        ramp_frac = min(1.0, steps_since_dream / max(1, ramp_steps))
+        dream_frac = 0.20 * (1.0 - ramp_frac) + dream_frac * ramp_frac
+
+        real_ratio = 1.0 - dream_frac
         real_batch_size = int(batch_size * real_ratio)
         dream_batch_size = batch_size - real_batch_size
         
