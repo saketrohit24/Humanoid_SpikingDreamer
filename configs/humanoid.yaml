@@ -7,8 +7,8 @@ checkpoint_freq: 50000    # Save resumable checkpoint every 50k steps (keeps las
 
 # Humanoid is higher dimensional and generally needs more warmup.
 start_timesteps: 50000
-dream_start_step: 300000  # Wait until agent can walk — richer WM training data
-dream_ramp_steps: 100000  # Ramp dream ratio from 20% → full over 100k steps after dream start
+dream_start_step: 150000  # Start dreaming once agent has basic locomotion
+dream_ramp_steps: 50000   # Ramp dream ratio from 20% → full over 50k steps after dream start
 dream_horizon: 1
 
 # Permissive threshold: Humanoid has high-dim obs so ensemble variance is naturally larger.
