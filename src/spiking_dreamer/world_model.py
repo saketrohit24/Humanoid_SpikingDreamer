@@ -52,9 +52,18 @@ class ImprovedSpikingWorldModel(nn.Module):
         self.action_encoder = PopulationEncoder(action_dim, population_size)
         
         encoded_dim = (state_dim + action_dim) * population_size
-        
-        # Input projection
-        self.fc_in = nn.Linear(encoded_dim, hidden_dim)
+
+        # Input projection — gradual compression for high-dim inputs (e.g. Humanoid 3144 → 1024 → 512)
+        # Single-step 3144 → 256 is a 12:1 bottleneck that loses joint coupling information.
+        self.use_pre_proj = encoded_dim > hidden_dim * 2
+        if self.use_pre_proj:
+            pre_dim = hidden_dim * 2
+            self.fc_pre = nn.Linear(encoded_dim, pre_dim)
+            self.ln_pre = nn.LayerNorm(pre_dim)
+            self.fc_in = nn.Linear(pre_dim, hidden_dim)
+        else:
+            self.fc_pre = None
+            self.fc_in = nn.Linear(encoded_dim, hidden_dim)
         self.ln_in = nn.LayerNorm(hidden_dim)
         
         # Multi-scale spiking layers
@@ -144,7 +153,9 @@ class ImprovedSpikingWorldModel(nn.Module):
         action_encoded = self.action_encoder(x[:, self.state_dim:])
         encoded = torch.cat([state_encoded, action_encoded], dim=-1)
         
-        # Project to hidden
+        # Project to hidden — gradual compression if pre_proj exists
+        if self.use_pre_proj:
+            encoded = F.silu(self.ln_pre(self.fc_pre(encoded)))
         h_input = self.ln_in(self.fc_in(encoded))
         
         # Initialize states
