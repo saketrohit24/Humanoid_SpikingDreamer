@@ -17,7 +17,7 @@ from typing import Dict
 
 from .actor import SNN_Actor
 from .critic import Critic
-from .ensemble import ImprovedEnsembleSpikingWorldModel
+from .ensemble import FastEnsembleSpikingWorldModel
 from .dreamer import EnhancedDreamer
 from .replay_buffer import ReplayBuffer
 
@@ -57,7 +57,7 @@ class TD3_SpikingDreamer:
         self.critic_optimizer = Adam(self.critic.parameters(), lr=config["critic_lr"])
         
         # Ensemble spiking world model
-        self.world_model = ImprovedEnsembleSpikingWorldModel(
+        self.world_model = FastEnsembleSpikingWorldModel(
             num_models=config["num_ensemble"],
             state_dim=state_dim, 
             action_dim=action_dim,

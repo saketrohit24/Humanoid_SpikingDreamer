@@ -37,3 +37,6 @@ wm_hidden_dim: 512
 
 # Train WM 4 gradient steps per env step — Humanoid dynamics are harder to learn.
 wm_updates_per_step: 4
+
+# Reduce spike steps from 8 → 4 to halve SNN simulation cost (8 steps × 2 layers × 3 scales × 5 models = 240 updates → 120)
+wm_spike_steps: 4

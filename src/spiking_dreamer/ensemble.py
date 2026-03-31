@@ -193,6 +193,10 @@ class FastEnsembleSpikingWorldModel(nn.Module):
         self._last_epistemic_stats = {'mean_epistemic': 0.0, 'std_epistemic': 0.0, 'max_epistemic': 0.0}
         self._last_stats = {}
         
+    def _sync_params(self):
+        """Re-stack model parameters so vmap uses up-to-date weights after optimizer steps."""
+        self.params, self.buffers = stack_module_state(self.models)
+
     def forward_parallel(self, obs, act):
         """Helper to run vmap step."""
         def call_single_model(params, buffers, o, a):
@@ -201,6 +205,7 @@ class FastEnsembleSpikingWorldModel(nn.Module):
         return vmap(call_single_model, in_dims=(0, 0, None, None), randomness='different')(self.params, self.buffers, obs, act)
 
     def step(self, state, action, deterministic=True):
+        self._sync_params()
         # Run all models in parallel
         next_states, rewards, logvars, _, _, stats = self.forward_parallel(state, action)
         
@@ -231,6 +236,7 @@ class FastEnsembleSpikingWorldModel(nn.Module):
 
     def compute_loss(self, batch, use_nll=False):
         """Optimized parallel loss computation."""
+        self._sync_params()
         batch_size = batch['obs'].shape[0]
         device = batch['obs'].device
         
