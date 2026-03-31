@@ -30,7 +30,7 @@ dreams_per_phase: 8
 # Disable adaptive threshold to keep it stable at 1.5.
 adaptive_threshold: false
 
-num_ensemble: 5
+num_ensemble: 3  # Reduced from 5 — FastEnsemble runs all in parallel (vmap), 5×7.7M params OOMs on 96GB GPU
 
 # More WM capacity for 376-dim Humanoid (vs 256 for HalfCheetah's 17-dim).
 wm_hidden_dim: 512
