@@ -125,17 +125,16 @@ class TD3_SpikingDreamer:
         }
         
         self.wm_optimizer.zero_grad()
-        
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            loss, state_mse, reward_mse, vq_loss = self.world_model.compute_loss(batch)
-            
-        self.wm_scaler.scale(loss).backward()
-        self.wm_scaler.unscale_(self.wm_optimizer)
-        
+
+        # FastEnsemble uses vmap which is incompatible with autocast+GradScaler.
+        # Plain fp32 is stable enough for WM training.
+        loss, state_mse, reward_mse, vq_loss = self.world_model.compute_loss(batch)
+        loss.backward()
+
         # Gradient norm tracking
         snn_norm = 0.0
         direct_norm = 0.0
-        
+
         try:
             first_model = self.world_model.models[0]
             for param in first_model.snn_layers.parameters():
@@ -150,8 +149,7 @@ class TD3_SpikingDreamer:
             pass
 
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
-        self.wm_scaler.step(self.wm_optimizer)
-        self.wm_scaler.update()
+        self.wm_optimizer.step()
         
         # Update EMA of state_mse for adaptive dream ratio
         self.wm_mse_ema = 0.995 * self.wm_mse_ema + 0.005 * state_mse
