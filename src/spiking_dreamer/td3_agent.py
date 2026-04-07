@@ -129,6 +129,13 @@ class TD3_SpikingDreamer:
         # FastEnsemble uses vmap which is incompatible with autocast+GradScaler.
         # Plain fp32 is stable enough for WM training.
         loss, state_mse, reward_mse, vq_loss = self.world_model.compute_loss(batch)
+
+        # NaN guard: skip backward if loss exploded
+        if not torch.isfinite(loss):
+            print(f"WARNING: WM loss is {loss.item()} — skipping update to prevent NaN propagation")
+            self.wm_optimizer.zero_grad()
+            return {'loss': float('nan')}
+
         loss.backward()
 
         # Gradient norm tracking
@@ -261,7 +268,13 @@ class TD3_SpikingDreamer:
         
         current_Q1, current_Q2 = self.critic(state, action)
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
-        
+
+        # NaN guard: skip critic update if loss is bad
+        if not torch.isfinite(critic_loss):
+            print(f"WARNING: critic_loss={critic_loss.item()} — skipping critic update")
+            self.critic_optimizer.zero_grad()
+            return 0.0, 0.0
+
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         # FIX 3: Clip critic gradients — prevents Q-value explosions from
@@ -273,7 +286,13 @@ class TD3_SpikingDreamer:
         actor_loss = 0.0
         if self.total_it % self.policy_freq == 0:
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
-            
+
+            # NaN guard: skip actor update if loss is bad
+            if not torch.isfinite(actor_loss):
+                print(f"WARNING: actor_loss={actor_loss.item()} — skipping actor update")
+                self.actor_optimizer.zero_grad()
+                return critic_loss.item(), 0.0
+
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             # FIX 3 (cont): Clip actor gradients too.
@@ -421,7 +440,7 @@ class TD3_SpikingDreamer:
 
     def load_checkpoint(self, filename):
         """Load full checkpoint. Returns (step, best_reward, evaluations)."""
-        ckpt = torch.load(filename, map_location=self.device)
+        ckpt = torch.load(filename, map_location=self.device, weights_only=False)
         # Model weights
         self.actor.load_state_dict(ckpt['actor'])
         self.actor_target.load_state_dict(ckpt['actor_target'])
@@ -439,7 +458,7 @@ class TD3_SpikingDreamer:
         return ckpt['step'], ckpt['best_reward'], ckpt['evaluations']
 
     def load(self, filename):
-        ckpt = torch.load(filename, map_location=self.device)
+        ckpt = torch.load(filename, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(ckpt['actor'])
         self.actor_target.load_state_dict(ckpt['actor_target'])
         self.critic.load_state_dict(ckpt['critic'])
