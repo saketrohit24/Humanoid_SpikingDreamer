@@ -43,9 +43,8 @@ class ImprovedSpikingWorldModel(nn.Module):
         # Track detailed stats
         self._last_forward_stats = {}
         
-        # OPTIMIZATION: Compile the heavy spiking forward pass
-        if hasattr(torch, "compile"):
-            self.forward_spiking = torch.compile(self.forward_spiking, mode="max-autotune")
+        # torch.compile disabled — max-autotune causes cudaErrorLaunchTimeout
+        # on shared HPC nodes where the GPU watchdog timer kills long-running kernels.
         
         # Population encoder for inputs
         self.state_encoder = PopulationEncoder(state_dim, population_size)
@@ -265,7 +264,9 @@ class ImprovedSpikingWorldModel(nn.Module):
         
         # Combine (learned weighting could be added)
         delta = 0.7 * delta_decoded + 0.3 * delta_direct
-        
+        # Clamp delta to prevent exploding predictions → NaN next_state
+        delta = torch.clamp(delta, -20.0, 20.0)
+
         # Predict reward
         reward = self.reward_head(hidden)
         
