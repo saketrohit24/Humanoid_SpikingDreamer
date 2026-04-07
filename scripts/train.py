@@ -189,6 +189,14 @@ def main():
         done = d1 or d2
         done_bool = float(done) if episode_timesteps < env._max_episode_steps else 0
 
+        # NaN guard: MuJoCo can return NaN contact forces on degenerate states
+        if np.isnan(next_state).any() or np.isnan(reward):
+            state, _ = env.reset()
+            episode_reward = 0
+            episode_timesteps = 0
+            episode_num += 1
+            continue
+
         replay_buffer.add(state, action, next_state, reward, done_bool, is_dream=False)
         state = next_state
         episode_reward += reward
@@ -209,6 +217,10 @@ def main():
                 dreams_added, phase_metrics_list = policy.dream_phase(replay_buffer)
                 if phase_metrics_list:
                     last_dream_metrics = phase_metrics_list[-1]
+                    if dreams_added == 0:
+                        mean_unc = last_dream_metrics.get('mean_uncertainty', -1)
+                        thresh = last_dream_metrics.get('epistemic_threshold', -1)
+                        print(f"  [Dream] 0 accepted — mean_unc={mean_unc:.4f} threshold={thresh:.4f}")
         
         if done:
             dream_buf_size = policy.dream_buffer.size if config["enable_dreaming"] else 0
